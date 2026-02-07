@@ -39,81 +39,153 @@ if 'last_data' not in st.session_state:
     st.session_state.last_data = None
 if 'error_count' not in st.session_state:
     st.session_state.error_count = 0
+if 'current_source' not in st.session_state:
+    st.session_state.current_source = None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHING WITH RETRY LOGIC
+# MULTI-SOURCE DATA FETCHING (FIXES GEO-BLOCKING)
 # ══════════════════════════════════════════════════════════════════════════════
-def fetch_binance_klines(interval='1m', limit=1000, max_retries=3):
-    """Fetch real 1-minute BTCUSDT candles from Binance with retry logic"""
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol": "BTCUSDT",
-        "interval": interval,
-        "limit": min(limit, 1000)  # Binance max is 1000
-    }
+
+def fetch_from_coinbase(limit=1000):
+    """Fetch from Coinbase Pro API - no geo-blocking"""
+    try:
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        
+        # Coinbase uses granularity in seconds
+        params = {
+            "granularity": 60  # 1 minute candles
+        }
+        
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if not isinstance(data, list) or len(data) == 0:
+            return pd.DataFrame()
+        
+        # Coinbase format: [time, low, high, open, close, volume]
+        df = pd.DataFrame(data, columns=['timestamp', 'low', 'high', 'open', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        df = df.dropna()
+        df = df.sort_values('timestamp')
+        df = df.set_index('timestamp')
+        
+        # Limit to requested amount
+        df = df.tail(limit)
+        
+        return df
+        
+    except Exception as e:
+        return pd.DataFrame()
+
+def fetch_from_kraken(limit=1000):
+    """Fetch from Kraken API - reliable alternative"""
+    try:
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {
+            "pair": "XBTUSD",
+            "interval": 1,  # 1 minute
+            "since": int(time.time()) - (limit * 60)  # Get last N minutes
+        }
+        
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if 'result' not in data or 'XXBTZUSD' not in data['result']:
+            return pd.DataFrame()
+        
+        # Kraken format: [time, open, high, low, close, vwap, volume, count]
+        ohlc_data = data['result']['XXBTZUSD']
+        df = pd.DataFrame(ohlc_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='s')
+        
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        df = df.dropna()
+        df = df.set_index('timestamp')
+        
+        return df
+        
+    except Exception as e:
+        return pd.DataFrame()
+
+def fetch_from_coingecko(limit=1000):
+    """Fetch from CoinGecko API - free and reliable"""
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        
+        # CoinGecko uses days parameter
+        days = max(1, limit // 1440 + 1)  # Convert minutes to days
+        
+        params = {
+            "vs_currency": "usd",
+            "days": min(days, 90),  # Max 90 days for free tier
+            "interval": "minute" if days <= 1 else "hourly"
+        }
+        
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if 'prices' not in data or len(data['prices']) == 0:
+            return pd.DataFrame()
+        
+        # CoinGecko only provides price data, we need to construct OHLC
+        prices = pd.DataFrame(data['prices'], columns=['timestamp', 'close'])
+        prices['timestamp'] = pd.to_datetime(prices['timestamp'], unit='ms')
+        
+        # Resample to 1-minute and create OHLC
+        prices = prices.set_index('timestamp')
+        df = prices.resample('1T').agg({
+            'close': ['first', 'max', 'min', 'last']
+        })
+        
+        df.columns = ['open', 'high', 'low', 'close']
+        df['volume'] = 0  # CoinGecko free tier doesn't provide volume in this endpoint
+        
+        df = df.dropna()
+        df = df.tail(limit)
+        
+        return df
+        
+    except Exception as e:
+        return pd.DataFrame()
+
+def fetch_crypto_data_multi_source(limit=1000):
+    """Try multiple sources to avoid geo-blocking issues"""
+    sources = [
+        ("Coinbase", fetch_from_coinbase),
+        ("Kraken", fetch_from_kraken),
+        ("CoinGecko", fetch_from_coingecko)
+    ]
     
-    for attempt in range(max_retries):
+    for source_name, fetch_func in sources:
         try:
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
+            df = fetch_func(limit)
             
-            if not isinstance(data, list) or len(data) == 0:
-                raise ValueError("Empty or invalid response from Binance")
-            
-            df = pd.DataFrame(data, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-                'taker_buy_quote', 'ignore'
-            ])
-            
-            # Convert to proper types with error handling
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
-            
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # Drop any rows with NaN values
-            df = df.dropna()
-            
-            if df.empty:
-                raise ValueError("All data was invalid after conversion")
-            
-            df = df.set_index('timestamp')
-            
-            # Store successful fetch
-            st.session_state.last_data = df.copy()
-            st.session_state.error_count = 0
-            
-            return df
-            
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))  # Exponential backoff
-                continue
-            else:
-                st.session_state.error_count += 1
-                return use_fallback_data(f"Network error: {str(e)}")
+            if not df.empty and len(df) >= 10:
+                st.session_state.current_source = source_name
+                st.session_state.last_data = df.copy()
+                st.session_state.error_count = 0
+                return df
                 
         except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(0.5)
-                continue
-            else:
-                st.session_state.error_count += 1
-                return use_fallback_data(f"Data error: {str(e)}")
+            continue
     
-    return use_fallback_data("Max retries exceeded")
-
-def use_fallback_data(error_msg):
-    """Use cached data if available, otherwise return empty DataFrame"""
+    # All sources failed, use cached data
     if st.session_state.last_data is not None and not st.session_state.last_data.empty:
-        st.warning(f"⚠️ Using cached data due to: {error_msg}")
+        st.warning("⚠️ Using cached data - all live sources unavailable")
         return st.session_state.last_data.copy()
-    else:
-        st.error(f"❌ No data available: {error_msg}")
-        return pd.DataFrame()
+    
+    return pd.DataFrame()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA RESAMPLING
@@ -142,18 +214,12 @@ def resample_to_timeframe(df, timeframe):
             'volume': 'sum'
         }).dropna()
         
-        # Validate resampled data
-        if resampled.empty:
-            return pd.DataFrame()
-        
-        # Ensure we have enough data points
-        if len(resampled) < 5:
+        if resampled.empty or len(resampled) < 5:
             return pd.DataFrame()
         
         return resampled
         
     except Exception as e:
-        st.error(f"Resampling error for {timeframe}: {str(e)}")
         return pd.DataFrame()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -171,7 +237,7 @@ def engineer_features(df, min_periods=30):
         try:
             df.ta.rsi(length=14, append=True)
         except:
-            df['RSI_14'] = 50  # Neutral fallback
+            df['RSI_14'] = 50
         
         # MACD
         try:
@@ -193,16 +259,13 @@ def engineer_features(df, min_periods=30):
         # Target (for training)
         df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
         
-        # Fill any remaining NaN with forward fill then backward fill
+        # Fill NaN
         df = df.fillna(method='ffill').fillna(method='bfill')
-        
-        # Final dropna for any still-missing values
         df = df.dropna()
         
         return df
         
     except Exception as e:
-        st.error(f"Feature engineering error: {str(e)}")
         return pd.DataFrame()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,11 +279,9 @@ def get_model_for_timeframe(df_resampled, timeframe, min_samples=20):
         if df_feat.empty or len(df_feat) < min_samples:
             return None, [], "Insufficient data"
         
-        # Define features to use
         base_features = ['RSI_14', 'MACD_12_26_9', 'MACDs_12_26_9', 'MACDh_12_26_9',
                         'BBM_20_2.0', 'returns']
         
-        # Check which features are available
         available_features = [f for f in base_features if f in df_feat.columns]
         
         if len(available_features) < 3:
@@ -229,23 +290,20 @@ def get_model_for_timeframe(df_resampled, timeframe, min_samples=20):
         X = df_feat[available_features]
         y = df_feat['target']
         
-        # Validate data
         if X.isnull().any().any() or y.isnull().any():
             X = X.fillna(0)
             y = y.fillna(0)
         
-        # Check for variance
         if X.std().min() == 0:
             return None, [], "No variance in features"
         
-        # Train model
         model = LGBMClassifier(
             n_estimators=100,
             learning_rate=0.05,
             max_depth=5,
             verbose=-1,
             random_state=42,
-            force_col_wise=True  # Suppress warnings
+            force_col_wise=True
         )
         
         model.fit(X, y)
@@ -258,7 +316,6 @@ def get_model_for_timeframe(df_resampled, timeframe, min_samples=20):
 def predict_direction(df_resampled, timeframe):
     """Make prediction with fallback for errors"""
     try:
-        # Get or train model
         model, feats, status = get_model_for_timeframe(df_resampled, timeframe)
         
         if model is None:
@@ -267,26 +324,19 @@ def predict_direction(df_resampled, timeframe):
         if df_resampled.empty or len(df_resampled) < 10:
             return "Warming Up", 0.5, "Need more candles"
         
-        # Get features for latest candle
         df_feat = engineer_features(df_resampled)
         
         if df_feat.empty:
             return "Feature Error", 0.5, "Could not compute indicators"
         
-        # Extract latest features
         latest_features = df_feat[feats].iloc[-1:].values
         
-        # Handle NaN in features
         if np.isnan(latest_features).any():
             latest_features = np.nan_to_num(latest_features, 0)
         
-        # Make prediction
         prob = model.predict_proba(latest_features)[0]
-        
-        # Get probability of price going up
         up_prob = prob[1] if len(prob) > 1 else 0.5
         
-        # Determine direction
         direction = "HIGHER ↑" if up_prob > 0.5 else "LOWER ↓"
         confidence = max(up_prob, 1 - up_prob)
         
@@ -301,9 +351,8 @@ def predict_direction(df_resampled, timeframe):
 def render_prediction_card(tf, df_tf, prediction, confidence, status):
     """Render prediction card with status indicators"""
     
-    # Determine card color based on prediction
     if "Error" in prediction or "Insufficient" in prediction or "Warming" in prediction:
-        color = "#ffcc00"  # Warning yellow
+        color = "#ffcc00"
         display_text = prediction
         confidence_text = "Waiting for data..."
     else:
@@ -311,7 +360,6 @@ def render_prediction_card(tf, df_tf, prediction, confidence, status):
         display_text = prediction
         confidence_text = f"Confidence: {confidence:.1%}"
     
-    # Get current price info
     if not df_tf.empty:
         current_price = df_tf['close'].iloc[-1]
         current_open = df_tf['open'].iloc[-1]
@@ -322,7 +370,6 @@ def render_prediction_card(tf, df_tf, prediction, confidence, status):
         price_text = "Loading..."
         price_color = "#888"
     
-    # Status indicator
     status_icon = "🟢" if status == "success" else "🟡"
     
     st.markdown(f"""
@@ -349,8 +396,14 @@ def main():
     show_debug = st.sidebar.toggle("Show debug info", value=False)
     
     st.sidebar.markdown("---")
-    st.sidebar.caption("📊 Data Source: Binance Public API")
+    
+    if st.session_state.current_source:
+        st.sidebar.success(f"📊 Data Source: {st.session_state.current_source}")
+    else:
+        st.sidebar.info("📊 Data Source: Connecting...")
+    
     st.sidebar.caption(f"🔄 Error Count: {st.session_state.error_count}")
+    st.sidebar.caption("💡 Using geo-blocking resistant APIs")
     
     # Header
     st.title("🚀 BTC Pulse Predictor")
@@ -358,12 +411,14 @@ def main():
     
     # Fetch data with loading indicator
     with st.spinner("📡 Fetching live market data..."):
-        df_1m = fetch_binance_klines('1m', limit=1000)
+        df_1m = fetch_crypto_data_multi_source(limit=1000)
     
     # Check if we got data
     if df_1m.empty:
-        st.error("❌ Unable to load market data. Please check your internet connection.")
-        st.info("The app will attempt to reconnect automatically.")
+        st.error("❌ Unable to load market data from all sources.")
+        st.info("Trying: Coinbase → Kraken → CoinGecko")
+        st.info("The app will retry automatically. If this persists, check requirements.txt includes 'requests'")
+        
         if auto_refresh:
             time.sleep(15)
             st.rerun()
@@ -377,7 +432,7 @@ def main():
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         st.metric(
-            label="Bitcoin (BTCUSDT)",
+            label="Bitcoin (BTC/USD)",
             value=f"${current_price:,.2f}",
             delta=f"{price_change_pct:+.2f}%"
         )
@@ -396,13 +451,8 @@ def main():
     
     for i, tf in enumerate(timeframes):
         with cols[i]:
-            # Resample data
             df_tf = resample_to_timeframe(df_1m, tf)
-            
-            # Make prediction
             pred, conf, status = predict_direction(df_tf, tf)
-            
-            # Render card
             render_prediction_card(tf, df_tf, pred, conf, status)
     
     st.markdown("---")
@@ -414,14 +464,13 @@ def main():
     
     if not df_1h.empty and len(df_1h) > 0:
         try:
-            # Create candlestick chart
             fig = go.Figure(data=[go.Candlestick(
                 x=df_1h.index,
                 open=df_1h['open'],
                 high=df_1h['high'],
                 low=df_1h['low'],
                 close=df_1h['close'],
-                name="BTCUSDT"
+                name="BTC/USD"
             )])
             
             fig.update_layout(
@@ -447,6 +496,7 @@ def main():
         st.subheader("🔧 Debug Information")
         st.write(f"**Data points available:** {len(df_1m)}")
         st.write(f"**Latest timestamp:** {df_1m.index[-1]}")
+        st.write(f"**Data source:** {st.session_state.current_source}")
         st.write(f"**Cached data available:** {'Yes' if st.session_state.last_data is not None else 'No'}")
         with st.expander("View raw data sample"):
             st.dataframe(df_1m.tail(10))
