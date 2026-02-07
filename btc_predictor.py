@@ -7,11 +7,11 @@ import pandas_ta as ta
 from lightgbm import LGBMClassifier
 import warnings
 
-# Optimization: Suppress lightgbm and pandas warnings
+# Optimization: Silence LightGBM logs to keep the terminal clean
 warnings.filterwarnings('ignore')
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA & ML ENGINE (Optimized for Streamlit Cloud)
+# DATA & ENGINE (Memory-Safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_data():
@@ -24,16 +24,14 @@ def fetch_data():
         df = pd.DataFrame(ohlc, columns=['ts', 'open', 'high', 'low', 'close', 'vwap', 'vol', 'cnt'])
         df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='s')
         df = df[['ts', 'open', 'high', 'low', 'close']].set_index('ts').apply(pd.to_numeric)
-        # Keep only the last 720 rows (enough for 1D timeframe resample)
+        # RAM SAFETY: Only keep enough for analysis
         return df.tail(1000)
-    except Exception:
+    except:
         return pd.DataFrame()
 
-@st.cache_resource(ttl=300) # Cache the model for 5 mins to save RAM
-def train_and_predict(df_tf):
-    """Handles the ML logic in a cached block to prevent memory overflow."""
-    if len(df_tf) < 20: 
-        return "INIT...", 0.5
+@st.cache_resource(ttl=300) # Only re-train models every 5 minutes to stay under 1GB RAM
+def get_ml_signal(df_tf):
+    if len(df_tf) < 25: return "INIT...", 0.5
     
     df_tf = df_tf.copy()
     df_tf['RSI'] = ta.rsi(df_tf['close'], length=14)
@@ -54,67 +52,63 @@ def train_and_predict(df_tf):
         return "ERROR", 0.5
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TERMINAL INTERFACE
+# THE TERMINAL VIEW
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="BTC_TERMINAL", layout="centered")
 
-# Terminal Styling
 st.markdown("""
     <style>
     .stApp { background-color: #000000; }
-    .terminal-container {
+    .terminal-box {
         font-family: 'Courier New', Courier, monospace;
         color: #00FF41;
         background-color: #000000;
         padding: 20px;
         border: 1px solid #00FF41;
-        border-radius: 5px;
+        border-radius: 4px;
+        box-shadow: 0 0 10px rgba(0, 255, 65, 0.2);
     }
     .higher { color: #00FF41; font-weight: bold; }
     .lower { color: #FF3131; font-weight: bold; }
-    .header { color: #FFFFFF; border-bottom: 1px solid #333; margin-bottom: 10px; }
+    .header { color: #FFFFFF; border-bottom: 1px solid #333; margin-bottom: 12px; }
     </style>
 """, unsafe_allow_html=True)
 
-# Using a fragment to refresh specific parts without a full app crash
 @st.fragment(run_every=30)
-def terminal_display():
+def live_terminal():
     df = fetch_data()
     
     if not df.empty:
         now = time.strftime("%H:%M:%S")
         price = f"{df['close'].iloc[-1]:,.2f}"
         
-        tfs = {"1m": "1T", "5m": "5T", "15m": "15T", "1h": "1H", "1d": "1D"}
+        tfs = {"1M": "1T", "5M": "5T", "15M": "15T", "1H": "1H", "1D": "1D"}
         results = []
         
-        for name, rule in tfs.items():
+        for label, rule in tfs.items():
             df_tf = df.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-            side, prob = train_and_predict(df_tf)
+            side, prob = get_ml_signal(df_tf)
             
             color = "higher" if side == "HIGHER" else "lower"
             conf = prob if side == "HIGHER" else 1 - prob
-            results.append(f"[{name.upper():>3}] PREDICTION: <span class='{color}'>{side:<6}</span> | CONF: {conf:.1%}")
+            results.append(f"[{label:>3}] PREDICTION: <span class='{color}'>{side:<6}</span> | CONF: {conf:.1%}")
 
-        output = f"""
-        <div class="terminal-container">
-            <div class="header">BTC_PULSE_TERMINAL v2.1 // SOURCE: KRAKEN</div>
-            <div>TIMESTAMP: {now} | STATUS: CONNECTED</div>
-            <div>LIVE_BTC : <span class="higher">${price}</span></div>
+        terminal_html = f"""
+        <div class="terminal-box">
+            <div class="header">BTC_PULSE_TERMINAL_v2.5 // LIVE_FEED</div>
+            <div>UTC_TIME: {now} | STATUS: CONNECTED</div>
+            <div>PRICE_USD: <span class="higher">${price}</span></div>
             <br>
             {"<br>".join(results)}
             <br>
-            <div>--------------------------------------------------</div>
-            <div>[SYSTEM]: Analyzing market pulse...</div>
+            <div>------------------------------------------</div>
+            <div>[SYSTEM]: Awaiting next candle...</div>
         </div>
         """
-        st.markdown(output, unsafe_allow_html=True)
+        st.markdown(terminal_html, unsafe_allow_html=True)
     else:
-        st.error("SYSTEM_ERROR: Data Link Severed.")
-
-def main():
-    terminal_display()
+        st.error("DATA_LINK_FAILURE: Retrying connection...")
 
 if __name__ == "__main__":
-    main()
+    live_terminal()
