@@ -30,41 +30,40 @@ if 'accuracy' not in st.session_state:
     st.session_state.accuracy = {tf: {"correct":0, "total":0} for tf in ["1m","5m","15m","1h","1d"]}
 
 # ── DATA FETCHING ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=45)
-def fetch_binance_klines(interval='1m', limit=1000):
-    """Fetch real 1-minute BTCUSDT candles from Binance public API"""
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol": "BTCUSDT",
-        "interval": interval,
-        "limit": limit
-    }
+@st.cache_data(ttl=60)
+def fetch_coingecko_data(days=2):
+    """Fetch recent BTC price history from CoinGecko (approx 5-min intervals)"""
+    url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=minute&precision=full"
     try:
-        resp = requests.get(url, params=params, timeout=6).json()
-        if not isinstance(resp, list):
+        resp = requests.get(url, timeout=10).json()
+        if 'prices' not in resp or not resp['prices']:
+            st.warning("CoinGecko returned empty data")
             return pd.DataFrame()
         
-        df = pd.DataFrame(resp, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
-        ])
-        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype(float)
+        df = pd.DataFrame(resp['prices'], columns=['timestamp', 'close'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df = df.set_index('timestamp')
+        
+        # Approximate OHLC (common for price-only feeds)
+        df['open'] = df['close'].shift(1).fillna(df['close'])
+        df['high'] = df['close'].rolling(window=5, min_periods=1).max()   # rough approx
+        df['low']  = df['close'].rolling(window=5, min_periods=1).min()
+        df['volume'] = 0  # not available here
+        
         return df
     except Exception as e:
-        st.warning(f"Binance fetch failed: {str(e)}")
+        st.error(f"CoinGecko fetch failed: {str(e)}. Retrying next refresh...")
         return pd.DataFrame()
 
 def resample_to_timeframe(df, timeframe):
-    """Convert 1m data to requested timeframe"""
-    rule = {
-        '1m': '1T', '5m': '5T', '15m': '15T', '1h': '1H', '1d': '1D'
-    }.get(timeframe, '5T')
-    
+    """Resample approximate data to requested timeframe"""
     if df.empty:
         return pd.DataFrame()
+    
+    rule_map = {
+        '1m': '1T', '5m': '5T', '15m': '15T', '1h': '60T', '1d': '1D'
+    }
+    rule = rule_map.get(timeframe, '5T')
     
     return df.resample(rule).agg({
         'open': 'first',
@@ -72,7 +71,7 @@ def resample_to_timeframe(df, timeframe):
         'low': 'min',
         'close': 'last',
         'volume': 'sum'
-    }).dropna()
+    }).dropna(how='all')
 
 # ── FEATURE ENGINEERING & PREDICTION ─────────────────────────────────────────
 def engineer_features(df):
@@ -88,7 +87,7 @@ def engineer_features(df):
     
     return df.dropna()
 
-@st.cache_resource(ttl=300)  # 5 min cache per timeframe
+@st.cache_resource(ttl=300)  # cache 5 min
 def get_model_for_timeframe(df_resampled, timeframe):
     df_feat = engineer_features(df_resampled)
     if len(df_feat) < 15:
@@ -116,7 +115,7 @@ def predict_direction(df_resampled, timeframe):
         return "Waiting for data", 0.0
     
     latest = df_resampled.tail(1)
-    df_feat_latest = engineer_features(latest)  # just for latest row features
+    df_feat_latest = engineer_features(latest)
     
     if df_feat_latest.empty:
         return "Not enough recent data", 0.0
@@ -128,7 +127,7 @@ def predict_direction(df_resampled, timeframe):
         direction = "HIGHER" if up_prob > 0.5 else "LOWER"
         confidence = max(up_prob, 1 - up_prob)
         return direction, confidence
-    except:
+    except Exception:
         return "Prediction error", 0.0
 
 # ── UI COMPONENTS ────────────────────────────────────────────────────────────
@@ -141,7 +140,7 @@ def render_prediction_card(tf, df_tf, prediction, confidence):
         text = prediction
     
     current_open = df_tf['open'].iloc[-1] if not df_tf.empty else 0
-    time_remaining = "Calculating..."  # can be improved later
+    time_remaining = "Calculating..."  # placeholder
     
     with st.container():
         st.markdown(f"""
@@ -161,39 +160,35 @@ def render_prediction_card(tf, df_tf, prediction, confidence):
 def main():
     st.sidebar.title("⚙️ Settings")
     auto_refresh = st.sidebar.toggle("Auto-refresh (10s)", value=True)
-    st.sidebar.caption("Using Binance 1m data + resampling")
+    st.sidebar.caption("Using CoinGecko data (approx 5-min base) + resampling")
 
-    # Current price
     col1, col2 = st.columns([3, 1])
     with col1:
         st.title("BTC Pulse Predictor")
     
-    # Fetch base 1m data
     with st.spinner("Loading fresh market data..."):
-        df_1m = fetch_binance_klines('1m', limit=1440)  # ~1 day of 1m candles
-
-        if df_1m.empty:
-            st.error("Couldn't load data from Binance. Check your internet.")
+        df_base = fetch_coingecko_data(days=2)
+        
+        if df_base.empty:
+            st.error("Couldn't load data from CoinGecko. Check internet or try later.")
             return
-
-        current_price = df_1m['close'].iloc[-1]
+        
+        current_price = df_base['close'].iloc[-1]
         st.markdown(f"<h1 style='font-size: 3.4rem; margin: 0;'>${current_price:,.2f}</h1>", unsafe_allow_html=True)
-
-        # Timeframes setup
+        
         tfs = ["1m", "5m", "15m", "1h", "1d"]
         prediction_cols = st.columns(len(tfs))
-
+        
         for i, tf in enumerate(tfs):
-            df_tf = resample_to_timeframe(df_1m, tf)
-            
+            df_tf = resample_to_timeframe(df_base, tf)
             pred, conf = predict_direction(df_tf, tf)
             
             with prediction_cols[i]:
                 render_prediction_card(tf, df_tf, pred, conf)
-
-    # Chart (showing 1h for clarity)
+    
+    # Chart (1h view)
     st.subheader("Recent Market (1h candles)")
-    df_1h = resample_to_timeframe(df_1m, '1h')
+    df_1h = resample_to_timeframe(df_base, '1h')
     if not df_1h.empty:
         fig = go.Figure(data=[go.Candlestick(
             x=df_1h.index,
@@ -201,7 +196,7 @@ def main():
             high=df_1h['high'],
             low=df_1h['low'],
             close=df_1h['close'],
-            name="BTC/USDT"
+            name="BTC/USD"
         )])
         fig.update_layout(
             template="plotly_dark",
@@ -210,8 +205,8 @@ def main():
             xaxis_rangeslider_visible=False
         )
         st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} WAT • Data: Binance public API")
+    
+    st.caption(f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} WAT • Data: CoinGecko API")
 
     if auto_refresh:
         time.sleep(10)
