@@ -1,4 +1,3 @@
-# Required: pip install streamlit pandas numpy requests lightgbm pandas_ta scikit-learn
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,15 +7,15 @@ import pandas_ta as ta
 from lightgbm import LGBMClassifier
 import warnings
 
-# Suppress warnings for clean terminal output
+# Optimization: Suppress lightgbm and pandas warnings
 warnings.filterwarnings('ignore')
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA ENGINE (Intact from previous version)
+# DATA & ML ENGINE (Optimized for Streamlit Cloud)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_data():
-    """Fetches raw 1m OHLC data."""
+    """Fetches OHLC data with a row limit to prevent memory spikes."""
     try:
         url = "https://api.kraken.com/0/public/OHLC"
         params = {"pair": "XBTUSD", "interval": 1}
@@ -25,18 +24,18 @@ def fetch_data():
         df = pd.DataFrame(ohlc, columns=['ts', 'open', 'high', 'low', 'close', 'vwap', 'vol', 'cnt'])
         df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='s')
         df = df[['ts', 'open', 'high', 'low', 'close']].set_index('ts').apply(pd.to_numeric)
-        return df
-    except:
+        # Keep only the last 720 rows (enough for 1D timeframe resample)
+        return df.tail(1000)
+    except Exception:
         return pd.DataFrame()
 
-def get_signal(df, timeframe):
-    """Calculates ML signal for specified timeframe."""
-    rule = {'1m': '1T', '5m': '5T', '15m': '15T', '1h': '1H', '1d': '1D'}.get(timeframe, '1T')
-    df_tf = df.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+@st.cache_resource(ttl=300) # Cache the model for 5 mins to save RAM
+def train_and_predict(df_tf):
+    """Handles the ML logic in a cached block to prevent memory overflow."""
+    if len(df_tf) < 20: 
+        return "INIT...", 0.5
     
-    if len(df_tf) < 20: return "FETCHING", 0.0
-    
-    # Feature Engineering (Intact)
+    df_tf = df_tf.copy()
     df_tf['RSI'] = ta.rsi(df_tf['close'], length=14)
     df_tf['target'] = (df_tf['close'].shift(-1) > df_tf['close']).astype(int)
     df_tf = df_tf.ffill().dropna()
@@ -44,7 +43,8 @@ def get_signal(df, timeframe):
     try:
         X = df_tf[['RSI', 'close']].iloc[:-1]
         y = df_tf['target'].iloc[:-1]
-        model = LGBMClassifier(n_estimators=30, max_depth=3, verbosity=-1)
+        # Hyper-light model setup
+        model = LGBMClassifier(n_estimators=20, max_depth=2, verbosity=-1)
         model.fit(X, y)
         
         prob = model.predict_proba(df_tf[['RSI', 'close']].iloc[-1:])[0][1]
@@ -54,12 +54,12 @@ def get_signal(df, timeframe):
         return "ERROR", 0.5
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TERMINAL UI (Text-Only)
+# TERMINAL INTERFACE
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="BTC_TERMINAL", layout="centered")
 
-# CSS to simulate a terminal environment
+# Terminal Styling
 st.markdown("""
     <style>
     .stApp { background-color: #000000; }
@@ -68,53 +68,53 @@ st.markdown("""
         color: #00FF41;
         background-color: #000000;
         padding: 20px;
-        line-height: 1.4;
+        border: 1px solid #00FF41;
+        border-radius: 5px;
     }
     .higher { color: #00FF41; font-weight: bold; }
     .lower { color: #FF3131; font-weight: bold; }
-    .header { color: #FFFFFF; border-bottom: 1px solid #00FF41; margin-bottom: 10px; }
+    .header { color: #FFFFFF; border-bottom: 1px solid #333; margin-bottom: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-def main():
-    # Empty placeholder for the terminal feed
-    terminal_ui = st.empty()
+# Using a fragment to refresh specific parts without a full app crash
+@st.fragment(run_every=30)
+def terminal_display():
+    df = fetch_data()
     
-    while True:
-        df = fetch_data()
+    if not df.empty:
+        now = time.strftime("%H:%M:%S")
+        price = f"{df['close'].iloc[-1]:,.2f}"
         
-        if not df.empty:
-            now = time.strftime("%H:%M:%S")
-            price = f"{df['close'].iloc[-1]:,.2f}"
+        tfs = {"1m": "1T", "5m": "5T", "15m": "15T", "1h": "1H", "1d": "1D"}
+        results = []
+        
+        for name, rule in tfs.items():
+            df_tf = df.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+            side, prob = train_and_predict(df_tf)
             
-            # Gather Predictions
-            tfs = ["1m", "5m", "15m", "1h", "1d"]
-            results = []
-            for tf in tfs:
-                side, prob = get_signal(df, tf)
-                color_class = "higher" if side == "HIGHER" else "lower"
-                conf = prob if side == "HIGHER" else 1 - prob
-                results.append(f"[{tf.upper():>3}] PREDICTION: <span class='{color_class}'>{side:<6}</span> | CONF: {conf:.1%}")
+            color = "higher" if side == "HIGHER" else "lower"
+            conf = prob if side == "HIGHER" else 1 - prob
+            results.append(f"[{name.upper():>3}] PREDICTION: <span class='{color}'>{side:<6}</span> | CONF: {conf:.1%}")
 
-            # Building the Terminal String
-            output = f"""
-            <div class="terminal-container">
-                <div class="header">BTC_PULSE_TERMINAL v2.0 // STATUS: CONNECTED</div>
-                <div>TIMESTAMP: {now}</div>
-                <div>LIVE_BTC : <span class="higher">${price}</span></div>
-                <br>
-                {"<br>".join(results)}
-                <br>
-                <div>--------------------------------------------------</div>
-                <div>[SYSTEM]: Awaiting next candle close...</div>
-            </div>
-            """
-            terminal_ui.markdown(output, unsafe_allow_html=True)
-        else:
-            terminal_ui.markdown('<div class="terminal-container">ERROR: DATA_FEED_OFFLINE</div>', unsafe_allow_html=True)
+        output = f"""
+        <div class="terminal-container">
+            <div class="header">BTC_PULSE_TERMINAL v2.1 // SOURCE: KRAKEN</div>
+            <div>TIMESTAMP: {now} | STATUS: CONNECTED</div>
+            <div>LIVE_BTC : <span class="higher">${price}</span></div>
+            <br>
+            {"<br>".join(results)}
+            <br>
+            <div>--------------------------------------------------</div>
+            <div>[SYSTEM]: Analyzing market pulse...</div>
+        </div>
+        """
+        st.markdown(output, unsafe_allow_html=True)
+    else:
+        st.error("SYSTEM_ERROR: Data Link Severed.")
 
-        time.sleep(30)
-        st.rerun()
+def main():
+    terminal_display()
 
 if __name__ == "__main__":
     main()
